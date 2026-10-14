@@ -1,9 +1,10 @@
-// ESP32-S3-Touch-LCD-2  大臉小豬（新 GUI 版）
+// ESP32-S3-Touch-LCD-2  大臉小豬（飛蟲追蹤 v2 完整版）
 #include <Arduino.h>
 #include <Wire.h>
 #include <QMI8658.h>
 #include <LovyanGFX.hpp>
 #include "WiFiFood.h"
+#include "FlyBug.h"
 
 // ============================================================
 // LovyanGFX 硬體配置
@@ -54,18 +55,16 @@ float gx = 0, gy = 0, gz = 0;
 float rotX = 0, rotY = 0;
 unsigned long lastImuTime = 0;
 
-int currentView = 0;   // 0=PIG, 1=3D, 2=PIG3
+int currentView = 0;
 
 // ============================================================
-// 🎨 新 GUI 佈局常數
+// GUI 佈局
 // ============================================================
-// 頂欄
 #define VIEW_BTN_X  232
 #define VIEW_BTN_Y  6
 #define VIEW_BTN_W  80
 #define VIEW_BTN_H  22
 
-// 底欄
 #define COLD_BTN_X  8
 #define COLD_BTN_Y  198
 #define COLD_BTN_W  152
@@ -76,7 +75,6 @@ int currentView = 0;   // 0=PIG, 1=3D, 2=PIG3
 #define HEAT_BTN_W  152
 #define HEAT_BTN_H  36
 
-// 效果文字統一 Y
 #define EFFECT_TEXT_Y 182
 
 // ============================================================
@@ -86,7 +84,8 @@ enum EyeMood {
   EMO_NEUTRAL, EMO_HAPPY, EMO_SAD, EMO_ANGRY,
   EMO_SLEEPING, EMO_THINKING, EMO_LOVE, EMO_SURPRISED,
   EMO_OK, EMO_FOCUS, EMO_SQUINT, EMO_HUNGRY, EMO_SICK,
-  EMO_DIZZY, EMO_COLD, EMO_HEAT
+  EMO_DIZZY, EMO_COLD, EMO_HEAT,
+  EMO_ANNOYED
 };
 
 #define PIG_PINK        0xFC9F
@@ -174,6 +173,12 @@ const EyeMood exprCycle[] = {
 };
 const int EXPR_COUNT = sizeof(exprCycle) / sizeof(exprCycle[0]);
 int exprIndex = 0;
+
+// ★ 飛蟲追蹤狀態
+static uint32_t flyLockUntil = 0;
+static float    flyLockX = 0, flyLockY = 0;
+static float    headSmoothX = 0, headSmoothY = 0;
+static float    flyDistance = 999;
 
 // ============================================================
 // 顏色工具
@@ -493,7 +498,8 @@ void updateIMU() {
   float targetRotY = -atan2(ax, az);
   rotX += (targetRotX - rotX) * 0.15f;
   rotY += (targetRotY - rotY) * 0.15f;
-  if (currentView == 0 && !eyes.touching) {
+  // IMU 傾斜只在無觸控且無飛蟲時才影響視線
+  if (currentView == 0 && !eyes.touching && FlyBug::activeCount() == 0) {
     float tiltX = constrain(ax * 1.8f, -1.0f, 1.0f);
     float tiltY = constrain(ay * 1.8f, -1.0f, 1.0f);
     eyes.targetLookX = eyes.targetLookX * 0.92f + tiltX * 0.08f;
@@ -530,7 +536,8 @@ void updateMoodState(unsigned long now) {
   else if (still < SLEEPY_MS) currentMood = MOOD_SLEEPY;
   else                        currentMood = MOOD_ASLEEP;
 
-  if (eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT) return;
+  if (eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT ||
+      eyes.mood == EMO_ANNOYED) return;
 
   if (currentMood == MOOD_ASLEEP && prevMood != MOOD_ASLEEP) {
     setMood(EMO_SLEEPING, 0);
@@ -614,6 +621,7 @@ void setMood(EyeMood m, unsigned long durationMs) {
       case EMO_DIZZY:     spawnParticles(0xFFE0, 12); break;
       case EMO_COLD:      spawnParticles(0x07FF, 10); break;
       case EMO_HEAT:      spawnParticles(0xF800, 10); break;
+      case EMO_ANNOYED:   spawnParticles(0x7BEF, 5); break;
       default: break;
     }
     eyes.lastMood = m;
@@ -671,6 +679,11 @@ void setMood(EyeMood m, unsigned long durationMs) {
       eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.25f;
       eyes.left.targetLid = eyes.right.targetLid = 0.7f;
       break;
+    case EMO_ANNOYED:
+      eyes.targetColor = 0xFBE0;
+      eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.0f;
+      eyes.left.targetLid = eyes.right.targetLid = 0.45f;
+      break;
   }
 }
 
@@ -725,22 +738,45 @@ void drawPigBody(LovyanGFX& gfx, int bounceY = 0) {
   gfx.fillEllipse(cx+r-16, cy+14, 11, 6, lerpColor(eyes.color, PIG_BLUSH, 0.6f));
 }
 
+// ★ 改進版：眼球移動更多、瞳孔分離、飛蟲近時雙高光
 void drawEyeNormal(LovyanGFX& gfx, Eye& e) {
   int visibleH = (int)(e.h * e.lidOpen);
   if (visibleH < 3) visibleH = 3;
-  int cx = e.cx + (int)(eyes.lookX * 6);
-  int cy = e.cy + (int)(eyes.lookY * 4);
+
+  bool hasFly = FlyBug::activeCount() > 0;
+  float eyeMoveMul   = hasFly ? 10.0f : 6.0f;
+  float pupilMoveMul = hasFly ? 7.0f  : 4.0f;
+
+  int cx = e.cx + (int)(eyes.lookX * eyeMoveMul);
+  int cy = e.cy + (int)(eyes.lookY * (eyeMoveMul * 0.7f));
   int hw = e.w / 2, hh = visibleH / 2;
   int radius = min(hw, hh) / 2;
   if (radius < 2) radius = 2;
+
   gfx.fillRoundRect(cx-hw-2, cy-hh-2, e.w+4, visibleH+4, radius+2, eyes.bgColor);
   gfx.fillRoundRect(cx-hw, cy-hh, e.w, visibleH, radius, PIG_EYE_WHITE);
+
   if (visibleH > 8) {
     int pupilR = (int)(min(hw, hh) * 0.55f * e.pupilScale);
-    int px = cx + (int)(eyes.lookX * 4);
-    int py = cy + (int)(eyes.lookY * 3);
+
+    int px = cx + (int)(eyes.lookX * pupilMoveMul);
+    int py = cy + (int)(eyes.lookY * (pupilMoveMul * 0.7f));
+
+    // 瞳孔限制在眼白内
+    int maxOffsetX = hw - pupilR;
+    int maxOffsetY = visibleH/2 - pupilR;
+    if (px - cx > maxOffsetX) px = cx + maxOffsetX;
+    if (px - cx < -maxOffsetX) px = cx - maxOffsetX;
+    if (py - cy > maxOffsetY) py = cy + maxOffsetY;
+    if (py - cy < -maxOffsetY) py = cy - maxOffsetY;
+
     gfx.fillCircle(px, py, pupilR, PIG_EYE_BLACK);
     gfx.fillCircle(px - pupilR/3, py - pupilR/3, pupilR/3, PIG_EYE_WHITE);
+
+    // 飞虫近时第二高光
+    if (hasFly && e.pupilScale > 1.15f) {
+      gfx.fillCircle(px + pupilR/3, py + pupilR/4, pupilR/5, PIG_EYE_WHITE);
+    }
   }
 }
 
@@ -799,6 +835,23 @@ void drawEyeHeat(LovyanGFX& gfx, Eye& e) {
   gfx.drawLine(cx - e.w/2 + 3, cy, cx + e.w/2 - 3, cy, PIG_EYE_BLACK);
 }
 
+void drawEyeAnnoyed(LovyanGFX& gfx, Eye& e, bool isRight) {
+  int cx = e.cx, cy = e.cy;
+  int hw = e.w / 2, hh = e.h / 2;
+
+  gfx.fillRoundRect(cx - hw, cy - 2, e.w, 5, 2, PIG_EYE_BLACK);
+
+  int browY = cy - hh - 6;
+  int browInnerX = cx + (isRight ? -12 : 12);
+  int browOuterX = cx + (isRight ? 12 : -12);
+  int browInnerY = browY + 6;
+  int browOuterY = browY - 2;
+  for (int i = 0; i < 3; i++) {
+    gfx.drawLine(browInnerX, browInnerY + i,
+                 browOuterX, browOuterY + i, PIG_EYE_BLACK);
+  }
+}
+
 void drawColdEffect(LovyanGFX& gfx) {
   unsigned long now = millis();
   for (int i = 0; i < 8; i++) {
@@ -846,6 +899,39 @@ void drawHeatEffect(LovyanGFX& gfx) {
   gfx.setTextColor(0xF800, eyes.bgColor);
   gfx.setTextSize(2);
   gfx.drawString("HOT...", eyes.pig.cx, EFFECT_TEXT_Y);
+}
+
+void drawAnnoyedEffect(LovyanGFX& gfx) {
+  unsigned long now = millis();
+
+  gfx.setTextDatum(MC_DATUM);
+  gfx.setTextColor(0xFBE0, eyes.bgColor);
+  gfx.setTextSize(2);
+  float wobble = sin(now / 100.0) * 2;
+  gfx.drawString("ANNOYED...", eyes.pig.cx + wobble, EFFECT_TEXT_Y);
+
+  float wavePhase = sin(now / 150.0);
+  int handX = eyes.pig.cx + eyes.pig.r - 10 + (int)(wavePhase * 8);
+  int handY = eyes.pig.cy + 20;
+  gfx.fillCircle(handX, handY, 6, PIG_PINK);
+  gfx.drawCircle(handX, handY, 6, PIG_PINK_DARK);
+  for (int i = 0; i < 3; i++) {
+    gfx.drawLine(handX + 4, handY - 2 + i * 2,
+                 handX + 9, handY - 3 + i * 2, PIG_PINK_DARK);
+  }
+
+  int handX2 = eyes.pig.cx - eyes.pig.r + 10 - (int)(wavePhase * 8);
+  int handY2 = eyes.pig.cy + 20;
+  gfx.fillCircle(handX2, handY2, 6, PIG_PINK);
+  gfx.drawCircle(handX2, handY2, 6, PIG_PINK_DARK);
+  for (int i = 0; i < 3; i++) {
+    gfx.drawLine(handX2 - 4, handY2 - 2 + i * 2,
+                 handX2 - 9, handY2 - 3 + i * 2, PIG_PINK_DARK);
+  }
+
+  if ((now / 500) % 2 == 0) {
+    gfx.fillCircle(eyes.pig.cx + 50, eyes.pig.cy - 40, 2, 0x5D9B);
+  }
 }
 
 void drawSleepEffect(LovyanGFX& gfx) {
@@ -953,6 +1039,27 @@ void drawEyes(LovyanGFX& gfx) {
   eyes.pig.bounce = sin(eyes.breathPhase) * 2.5f;
   int bounceY = (int)eyes.pig.bounce;
 
+  // ★ 豬頭大幅轉向飛蟲方向（帶平滑）
+  int headOffsetX = 0;
+  int headOffsetY = 0;
+  if (FlyBug::activeCount() > 0) {
+    headSmoothX += (eyes.lookX * 8.0f - headSmoothX) * 0.35f;
+    headSmoothY += (eyes.lookY * 6.0f - headSmoothY) * 0.35f;
+    headOffsetX = (int)headSmoothX;
+    headOffsetY = (int)headSmoothY;
+  } else {
+    headSmoothX *= 0.85f;
+    headSmoothY *= 0.85f;
+    headOffsetX = (int)headSmoothX;
+    headOffsetY = (int)headSmoothY;
+  }
+  eyes.pig.cx += headOffsetX;
+  eyes.pig.cy += headOffsetY;
+  eyes.left.cx += headOffsetX;
+  eyes.right.cx += headOffsetX;
+  eyes.left.cy += headOffsetY;
+  eyes.right.cy += headOffsetY;
+
   static int dizzyOffsetX = 0;
   static int dizzyOffsetY = 0;
   bool isDizzy = (eyes.mood == EMO_DIZZY);
@@ -988,6 +1095,10 @@ void drawEyes(LovyanGFX& gfx) {
     case EMO_HEAT:
       drawEyeHeat(gfx, eyes.left); drawEyeHeat(gfx, eyes.right);
       drawHeatEffect(gfx); break;
+    case EMO_ANNOYED:
+      drawEyeAnnoyed(gfx, eyes.left, false);
+      drawEyeAnnoyed(gfx, eyes.right, true);
+      drawAnnoyedEffect(gfx); break;
     default:
       drawEyeNormal(gfx, eyes.left); drawEyeNormal(gfx, eyes.right); break;
   }
@@ -999,8 +1110,21 @@ void drawEyes(LovyanGFX& gfx) {
     eyes.left.cy -= dizzyOffsetY; eyes.right.cy -= dizzyOffsetY;
   }
 
-  // ★ WiFiFood 繪製（會自己決定顯示頂欄或廁所場景）
+  // 恢復豬頭偏移
+  if (FlyBug::activeCount() > 0) {
+    eyes.pig.cx -= headOffsetX;
+    eyes.pig.cy -= headOffsetY;
+    eyes.left.cx -= headOffsetX;
+    eyes.right.cx -= headOffsetX;
+    eyes.left.cy -= headOffsetY;
+    eyes.right.cy -= headOffsetY;
+  }
+
   WiFiFood::draw(gfx, eyes.pig.cx, eyes.pig.cy, eyes.pig.r, eyes.bgColor);
+
+  if (!WiFiFood::isInToilet()) {
+    FlyBug::draw(gfx);
+  }
 
   drawViewButton(gfx);
   drawBottomButtons(gfx);
@@ -1013,8 +1137,10 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
                   eyes.blinking || eyes.mood == EMO_SURPRISED ||
                   eyes.mood == EMO_LOVE || eyes.mood == EMO_DIZZY ||
                   eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT ||
+                  eyes.mood == EMO_ANNOYED ||
                   WiFiFood::getPhase() == WiFiFood::PHASE_EATING ||
-                  WiFiFood::getPhase() == WiFiFood::PHASE_DIGESTING;
+                  WiFiFood::getPhase() == WiFiFood::PHASE_DIGESTING ||
+                  FlyBug::activeCount() > 0;
   unsigned long interval = isActive ? 33 : 80;
   if (now - lastEyeUpdate < interval) return;
   lastEyeUpdate = now;
@@ -1027,19 +1153,76 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
   eyes.breathPhase += (eyes.mood == EMO_NEUTRAL || eyes.mood == EMO_HAPPY ||
                        eyes.mood == EMO_FOCUS) ? 0.08f : 0.05f;
 
+  // ★★★ 飛蟲追蹤 v2：逐帧 + 瞳孔縮放 + 鎖定
+  int flyX, flyY;
+  bool hasFly = FlyBug::getNearestFly(eyes.pig.cx, eyes.pig.cy, flyX, flyY);
+
+  if (hasFly) {
+    flyLockUntil = now + 500;
+    flyLockX = flyX;
+    flyLockY = flyY;
+    int dx = flyX - eyes.pig.cx;
+    int dy = flyY - eyes.pig.cy;
+    flyDistance = sqrtf(dx * dx + dy * dy);
+
+    float lx = constrain(dx / 40.0f, -1.3f, 1.3f);
+    float ly = constrain(dy / 40.0f, -1.3f, 1.3f);
+
+    eyes.targetLookX = lx;
+    eyes.targetLookY = ly;
+
+    // ★ 瞳孔放大（近距離專注）
+    float targetPupil = 1.0f;
+    if (flyDistance < 50)      targetPupil = 1.25f;
+    else if (flyDistance < 80) targetPupil = 1.1f;
+    eyes.left.targetPupilScale  = targetPupil;
+    eyes.right.targetPupilScale = targetPupil;
+
+    needRedraw = true;
+  } else {
+    flyDistance = 999;
+  }
+
+  // 平滑插值：飛蟲模式更快
   float lerp = 0.2f;
-  if (abs(eyes.lookX - eyes.targetLookX) > 0.02f) {
+  if (hasFly) lerp = 0.5f;
+
+  if (abs(eyes.lookX - eyes.targetLookX) > 0.005f) {
     eyes.lookX += (eyes.targetLookX - eyes.lookX) * lerp; needRedraw = true;
   }
-  if (abs(eyes.lookY - eyes.targetLookY) > 0.02f) {
+  if (abs(eyes.lookY - eyes.targetLookY) > 0.005f) {
     eyes.lookY += (eyes.targetLookY - eyes.lookY) * lerp; needRedraw = true;
   }
+
+  // 瞳孔縮放平滑
   for (auto* e : {&eyes.left, &eyes.right}) {
-    if (abs(e->pupilScale - e->targetPupilScale) > 0.02f) {
-      e->pupilScale += (e->targetPupilScale - e->pupilScale) * 0.15f;
+    if (abs(e->pupilScale - e->targetPupilScale) > 0.01f) {
+      float pScale = hasFly ? 0.25f : 0.15f;
+      e->pupilScale += (e->targetPupilScale - e->pupilScale) * pScale;
       needRedraw = true;
     }
   }
+
+  // 飛蟲出現 → 自動 ANNOYED
+  static bool flyAnnoyed = false;
+  if (FlyBug::activeCount() > 0 &&
+      eyes.mood != EMO_ANNOYED &&
+      eyes.mood != EMO_COLD && eyes.mood != EMO_HEAT &&
+      eyes.mood != EMO_DIZZY && eyes.mood != EMO_SLEEPING &&
+      !eyes.touching) {
+    if (!flyAnnoyed) {
+      setMood(EMO_ANNOYED, 0);
+      flyAnnoyed = true;
+      needRedraw = true;
+    }
+  } else if (FlyBug::activeCount() == 0 && flyAnnoyed) {
+    if (eyes.mood == EMO_ANNOYED) {
+      setMood(EMO_NEUTRAL, 0);
+    }
+    flyAnnoyed = false;
+    needRedraw = true;
+  }
+
   if (eyes.touching && now - eyes.touchStart > 1500) {
     if (eyes.mood != EMO_SQUINT) { setMood(EMO_SQUINT, 0); needRedraw = true; }
   }
@@ -1051,14 +1234,15 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
       eyes.mood != EMO_SLEEPING && eyes.mood != EMO_HAPPY &&
       eyes.mood != EMO_LOVE && eyes.mood != EMO_OK &&
       eyes.mood != EMO_SURPRISED && eyes.mood != EMO_DIZZY &&
-      eyes.mood != EMO_COLD && eyes.mood != EMO_HEAT) {
+      eyes.mood != EMO_COLD && eyes.mood != EMO_HEAT &&
+      eyes.mood != EMO_ANNOYED) {
     eyes.blinking = true; eyes.blinkStart = now;
     eyes.left.targetLid = eyes.right.targetLid = 0.0f;
     needRedraw = true;
   }
   if (eyes.blinking && now - eyes.blinkStart > 140) {
     eyes.blinking = false;
-    if (eyes.mood != EMO_SQUINT)
+    if (eyes.mood != EMO_SQUINT && eyes.mood != EMO_ANNOYED)
       eyes.left.targetLid = eyes.right.targetLid = 1.0f;
     eyes.nextBlink = now + random(2500, 6500);
     needRedraw = true;
@@ -1070,7 +1254,7 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
       needRedraw = true;
     }
   }
-  if (eyes.mood == EMO_NEUTRAL && !eyes.typingActive && !eyes.touching) {
+  if (eyes.mood == EMO_NEUTRAL && !eyes.typingActive && !eyes.touching && !hasFly) {
     float breath = sin(eyes.breathPhase) * 0.02f;
     eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.0f + breath;
   }
@@ -1097,8 +1281,10 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
       eyes.mood == EMO_LOVE || eyes.mood == EMO_SLEEPING ||
       eyes.mood == EMO_DIZZY ||
       eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT ||
+      eyes.mood == EMO_ANNOYED ||
       WiFiFood::isScanning() ||
-      WiFiFood::getPhase() == WiFiFood::PHASE_TOILET) needRedraw = true;
+      WiFiFood::getPhase() == WiFiFood::PHASE_TOILET ||
+      FlyBug::activeCount() > 0) needRedraw = true;
 
   static int breathFrame = 0;
   if (eyes.mood == EMO_NEUTRAL || eyes.mood == EMO_HAPPY || eyes.mood == EMO_FOCUS) {
@@ -1158,7 +1344,7 @@ void handleTouch(unsigned long now) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== 大臉小豬 + 便便 WiFi ===");
+  Serial.println("\n=== 大臉小豬 + 便便 WiFi + 飛蟲追蹤 v2 ===");
 
   randomSeed(esp_random());
 
@@ -1183,6 +1369,8 @@ void setup() {
   });
   WiFiFood::begin();
 
+  FlyBug::begin(eyes.pig.cx, eyes.pig.cy, eyes.pig.r);
+
   canvas.fillScreen(TFT_BLACK);
   drawEyes(canvas);
   canvas.pushSprite(0, 0);
@@ -1195,6 +1383,7 @@ void loop() {
   unsigned long now = millis();
   updateIMU();
   WiFiFood::update();
+  FlyBug::update(now);
   processIMUEvents(now);
   updateMoodState(now);
   handleTouch(now);
