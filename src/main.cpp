@@ -1,6 +1,8 @@
-// ESP32-S3-Touch-LCD-2  大臉小豬（飛蟲追蹤 v2 完整版）
+// ESP32-S3-Touch-LCD-2  大臉小豬 v4 — 智能寵物版
+// 含：情緒+3D+便便WiFi+飛蟲+晝夜+火焰+智能寵物
 #include <Arduino.h>
 #include <Wire.h>
+#include <time.h>
 #include <QMI8658.h>
 #include <LovyanGFX.hpp>
 #include "WiFiFood.h"
@@ -58,6 +60,40 @@ unsigned long lastImuTime = 0;
 int currentView = 0;
 
 // ============================================================
+// 🌅 晝夜系統
+// ============================================================
+#define TIME_WIFI_SSID ""
+#define TIME_WIFI_PASS ""
+
+bool ntpOK = false;
+int  hourNow = 8;
+bool isDay = true;
+uint32_t bootMillis = 0;
+uint32_t lastTimeCheck = 0;
+uint32_t lastNtpTry = 0;
+
+// ============================================================
+// 🧠 智能寵物狀態
+// ============================================================
+float loveMeter = 0;
+uint32_t lastInteraction = 0;
+uint32_t nextIdleAction = 0;
+uint32_t welcomeUntil = 0;
+bool     welcomeMode = false;
+int16_t  fingerX = 0, fingerY = 0;
+bool     fingerTracking = false;
+uint32_t fingerTrackEnd = 0;
+uint32_t wakeRageUntil = 0;
+
+const char* loveLevel() {
+  if (loveMeter >= 80) return "SOULMATE";
+  if (loveMeter >= 50) return "FRIEND";
+  if (loveMeter >= 20) return "BUDDY";
+  if (loveMeter >= 5)  return "STRANGER";
+  return "WARY";
+}
+
+// ============================================================
 // GUI 佈局
 // ============================================================
 #define VIEW_BTN_X  232
@@ -85,8 +121,44 @@ enum EyeMood {
   EMO_SLEEPING, EMO_THINKING, EMO_LOVE, EMO_SURPRISED,
   EMO_OK, EMO_FOCUS, EMO_SQUINT, EMO_HUNGRY, EMO_SICK,
   EMO_DIZZY, EMO_COLD, EMO_HEAT,
-  EMO_ANNOYED
+  EMO_ANNOYED,
+  EMO_SHY,
+  EMO_PROUD
 };
+
+int moodPriority(EyeMood m) {
+  switch (m) {
+    case EMO_SLEEPING: return 10;
+    case EMO_DIZZY:    return 9;
+    case EMO_COLD:     return 8;
+    case EMO_HEAT:     return 8;
+    case EMO_ANNOYED:  return 6;
+    case EMO_PROUD:    return 5;
+    case EMO_HAPPY:    return 4;
+    case EMO_LOVE:     return 4;
+    case EMO_SHY:      return 3;
+    case EMO_SURPRISED:return 3;
+    case EMO_ANGRY:    return 3;
+    case EMO_SAD:      return 3;
+    case EMO_THINKING: return 2;
+    case EMO_SQUINT:   return 2;
+    case EMO_SICK:     return 2;
+    case EMO_HUNGRY:   return 2;
+    case EMO_OK:       return 2;
+    case EMO_FOCUS:    return 2;
+    default:           return 1;
+  }
+}
+
+const char* moodName(EyeMood m) {
+  const char* names[] = {
+    "NEUTRAL","HAPPY","SAD","ANGRY","SLEEPING","THINKING","LOVE","SURPRISED",
+    "OK","FOCUS","SQUINT","HUNGRY","SICK","DIZZY","COLD","HEAT","ANNOYED",
+    "SHY","PROUD"
+  };
+  if (m <= EMO_PROUD) return names[m];
+  return "?";
+}
 
 #define PIG_PINK        0xFC9F
 #define PIG_PINK_DARK   0xD145
@@ -103,6 +175,15 @@ struct Particle {
   uint16_t color;
   bool active;
 };
+
+// ★ 火焰粒子
+#define MAX_FIRE 60
+struct FireP {
+  float x, y, vx, vy;
+  int life;
+  bool active;
+};
+static FireP fireP[MAX_FIRE];
 
 struct PigBody { int cx, cy, r; float breathe = 0, bounce = 0; };
 struct Eye {
@@ -137,8 +218,30 @@ struct EyeSystem {
 
 EyeSystem eyes;
 
+// ============================================================
+// 習慣養成
+// ============================================================
+struct Habits {
+  int fliesKilled = 0;
+  int wifiMeals = 0;
+  int shakes = 0;
+  int touches = 0;
+  int coldsUsed = 0;
+  int heatsUsed = 0;
+  uint32_t sessionStart = 0;
+};
+static Habits habits;
+
+static bool eggFlies10 = false;
+static bool eggFlies25 = false;
+static bool eggFlies50 = false;
+static bool eggWifi10 = false;
+
+// ============================================================
 // 前置宣告
+// ============================================================
 void setMood(EyeMood m, unsigned long durationMs = 0);
+void setMoodForced(EyeMood m, unsigned long durationMs = 0);
 bool hitViewButton(int16_t x, int16_t y);
 bool hitColdButton(int16_t x, int16_t y);
 bool hitHeatButton(int16_t x, int16_t y);
@@ -152,7 +255,6 @@ void draw3DPigView(LovyanGFX& gfx);
 // 邏輯系統
 // ============================================================
 enum DeskMood { MOOD_AWAKE, MOOD_SLEEPY, MOOD_ASLEEP };
-
 const uint32_t AWAKE_MS     = 20000;
 const uint32_t SLEEPY_MS    = 40000;
 const float    MOTION_GYRO  = 0.35f;
@@ -174,11 +276,13 @@ const EyeMood exprCycle[] = {
 const int EXPR_COUNT = sizeof(exprCycle) / sizeof(exprCycle[0]);
 int exprIndex = 0;
 
-// ★ 飛蟲追蹤狀態
 static uint32_t flyLockUntil = 0;
 static float    flyLockX = 0, flyLockY = 0;
 static float    headSmoothX = 0, headSmoothY = 0;
 static float    flyDistance = 999;
+
+static uint32_t yayUntil = 0;
+static uint32_t jumpUntil = 0;
 
 // ============================================================
 // 顏色工具
@@ -210,6 +314,54 @@ uint16_t hsvToRGB565(float h, float s, float v) {
 }
 
 // ============================================================
+// 🌅 時間更新
+// ============================================================
+void updateTime() {
+  if (millis() - lastTimeCheck < 1000) return;
+  lastTimeCheck = millis();
+
+  if (!ntpOK && strlen(TIME_WIFI_SSID) > 0 &&
+      millis() - lastNtpTry > 30000) {
+    lastNtpTry = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.begin(TIME_WIFI_SSID, TIME_WIFI_PASS);
+      Serial.println("[🌐] Trying WiFi for NTP...");
+    } else {
+      configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
+      struct tm ti;
+      if (getLocalTime(&ti, 100)) {
+        ntpOK = true;
+        hourNow = ti.tm_hour;
+        Serial.printf("[🌐] NTP synced: %02d:%02d\n", ti.tm_hour, ti.tm_min);
+      }
+    }
+  }
+
+  if (ntpOK && WiFi.status() == WL_CONNECTED) {
+    struct tm ti;
+    if (getLocalTime(&ti, 10)) hourNow = ti.tm_hour;
+  } else if (!ntpOK) {
+    uint32_t elapsed = millis() - bootMillis;
+    hourNow = (8 + (elapsed / 300000)) % 24;
+  }
+
+  bool wasDay = isDay;
+  isDay = (hourNow >= 6 && hourNow < 18);
+  if (wasDay != isDay) {
+    Serial.printf("[🌅] %s now (hour=%d)\n", isDay ? "DAY" : "NIGHT", hourNow);
+  }
+}
+
+uint16_t getSkyColor() {
+  int h = hourNow;
+  if (h >= 7 && h < 17)  return 0x1082;
+  if (h >= 17 && h < 19) return 0xFD20;
+  if (h >= 19 || h < 5)  return 0x0000;
+  if (h >= 5 && h < 7)   return 0xFD20;
+  return 0x1082;
+}
+
+// ============================================================
 // 按鈕判定
 // ============================================================
 bool hitViewButton(int16_t x, int16_t y) {
@@ -231,13 +383,11 @@ bool hitHeatButton(int16_t x, int16_t y) {
 void drawViewButton(LovyanGFX& gfx) {
   gfx.fillRoundRect(VIEW_BTN_X, VIEW_BTN_Y, VIEW_BTN_W, VIEW_BTN_H, 8, 0x2124);
   gfx.drawRoundRect(VIEW_BTN_X, VIEW_BTN_Y, VIEW_BTN_W, VIEW_BTN_H, 8, 0x07FF);
-
   const char* label;
   uint16_t col;
   if (currentView == 0)      { label = "3D >";   col = 0x07FF; }
   else if (currentView == 1) { label = "PIG3 >"; col = 0xFC9F; }
   else                       { label = "PIG >";  col = 0x07E0; }
-
   gfx.setTextDatum(MC_DATUM);
   gfx.setTextColor(col, 0x2124);
   gfx.setTextSize(1);
@@ -245,15 +395,11 @@ void drawViewButton(LovyanGFX& gfx) {
 }
 
 void drawBottomButtons(LovyanGFX& gfx) {
-  // ═══ COLD ═══
   bool coldActive = (eyes.mood == EMO_COLD);
   uint16_t coldBg = coldActive ? 0x07FF : 0x18E3;
-  uint16_t coldBorder = 0x07FF;
-
   gfx.fillRoundRect(COLD_BTN_X, COLD_BTN_Y, COLD_BTN_W, COLD_BTN_H, 10, coldBg);
-  gfx.drawRoundRect(COLD_BTN_X, COLD_BTN_Y, COLD_BTN_W, COLD_BTN_H, 10, coldBorder);
-  gfx.drawRoundRect(COLD_BTN_X+1, COLD_BTN_Y+1, COLD_BTN_W-2, COLD_BTN_H-2, 9, coldBorder);
-
+  gfx.drawRoundRect(COLD_BTN_X, COLD_BTN_Y, COLD_BTN_W, COLD_BTN_H, 10, 0x07FF);
+  gfx.drawRoundRect(COLD_BTN_X+1, COLD_BTN_Y+1, COLD_BTN_W-2, COLD_BTN_H-2, 9, 0x07FF);
   int snx = COLD_BTN_X + 26;
   int sny = COLD_BTN_Y + COLD_BTN_H / 2;
   uint16_t sc = coldActive ? 0x0000 : 0x07FF;
@@ -263,21 +409,16 @@ void drawBottomButtons(LovyanGFX& gfx) {
                  snx + cos(a) * 9, sny + sin(a) * 9, sc);
   }
   gfx.fillCircle(snx, sny, 2, sc);
-
   gfx.setTextDatum(MC_DATUM);
   gfx.setTextColor(coldActive ? 0x0000 : 0xFFFF, coldBg);
   gfx.setTextSize(2);
   gfx.drawString("COLD", COLD_BTN_X + COLD_BTN_W / 2 + 12, COLD_BTN_Y + COLD_BTN_H / 2);
 
-  // ═══ HEAT ═══
   bool heatActive = (eyes.mood == EMO_HEAT);
   uint16_t heatBg = heatActive ? 0xF800 : 0x18E3;
-  uint16_t heatBorder = 0xF800;
-
   gfx.fillRoundRect(HEAT_BTN_X, HEAT_BTN_Y, HEAT_BTN_W, HEAT_BTN_H, 10, heatBg);
-  gfx.drawRoundRect(HEAT_BTN_X, HEAT_BTN_Y, HEAT_BTN_W, HEAT_BTN_H, 10, heatBorder);
-  gfx.drawRoundRect(HEAT_BTN_X+1, HEAT_BTN_Y+1, HEAT_BTN_W-2, HEAT_BTN_H-2, 9, heatBorder);
-
+  gfx.drawRoundRect(HEAT_BTN_X, HEAT_BTN_Y, HEAT_BTN_W, HEAT_BTN_H, 10, 0xF800);
+  gfx.drawRoundRect(HEAT_BTN_X+1, HEAT_BTN_Y+1, HEAT_BTN_W-2, HEAT_BTN_H-2, 9, 0xF800);
   int hux = HEAT_BTN_X + 26;
   int huy = HEAT_BTN_Y + HEAT_BTN_H / 2;
   uint16_t hc = heatActive ? 0xFFFF : 0xFFE0;
@@ -349,17 +490,6 @@ void draw3DView(LovyanGFX& gfx) {
   gfx.setTextSize(2);
   gfx.drawString("3D CUBE", gfx.width() / 2, 6);
   draw3DCube(gfx, gfx.width() / 2, gfx.height() / 2 + 10, 55.0f);
-  char buf[64];
-  gfx.setTextDatum(BC_DATUM);
-  gfx.setTextColor(0xFFFF, TFT_BLACK);
-  gfx.setTextSize(1);
-  if (imuOK) {
-    snprintf(buf, sizeof(buf), "TILT aX=%.2f aY=%.2f", ax, ay);
-    gfx.drawString(buf, gfx.width() / 2, gfx.height() - 4);
-  } else {
-    gfx.setTextColor(0xF800, TFT_BLACK);
-    gfx.drawString("IMU not found", gfx.width() / 2, gfx.height() - 4);
-  }
   drawViewButton(gfx);
   WiFiFood::draw(gfx, gfx.width()/2, gfx.height()/2, 60, TFT_BLACK);
 }
@@ -404,21 +534,15 @@ void addBox3D(float cx, float cy, float cz, float sx, float sy, float sz, uint16
 void buildPig3D() {
   pigVertCount = pigTriCount = 0;
   uint16_t pink = 0xFC9F, pinkDark = 0xD145, snout = 0xF7BE;
-  uint16_t black = 0x0000;
   addBox3D(0, 0, 0, 0.55f, 0.45f, 0.85f, pink);
   addBox3D(0, -0.15f, 1.05f, 0.48f, 0.40f, 0.40f, pink);
   addBox3D(0, -0.15f, 1.52f, 0.25f, 0.18f, 0.08f, snout);
-  addBox3D(-0.10f, -0.15f, 1.60f, 0.04f, 0.06f, 0.02f, black);
-  addBox3D( 0.10f, -0.15f, 1.60f, 0.04f, 0.06f, 0.02f, black);
   addBox3D(-0.32f, -0.58f, 1.05f, 0.12f, 0.15f, 0.06f, pinkDark);
   addBox3D( 0.32f, -0.58f, 1.05f, 0.12f, 0.15f, 0.06f, pinkDark);
-  addBox3D(-0.20f, -0.28f, 1.44f, 0.07f, 0.07f, 0.04f, black);
-  addBox3D( 0.20f, -0.28f, 1.44f, 0.07f, 0.07f, 0.04f, black);
   addBox3D(-0.38f, 0.55f, -0.45f, 0.12f, 0.15f, 0.12f, pinkDark);
   addBox3D( 0.38f, 0.55f, -0.45f, 0.12f, 0.15f, 0.12f, pinkDark);
   addBox3D(-0.38f, 0.55f,  0.45f, 0.12f, 0.15f, 0.12f, pinkDark);
   addBox3D( 0.38f, 0.55f,  0.45f, 0.12f, 0.15f, 0.12f, pinkDark);
-  Serial.printf("[3D Pig] %d verts, %d tris\n", pigVertCount, pigTriCount);
 }
 
 void renderPig3D(LovyanGFX& gfx, int cx, int cy, float size, float rX, float rY, float rZ) {
@@ -465,17 +589,6 @@ void draw3DPigView(LovyanGFX& gfx) {
   gfx.setTextSize(2);
   gfx.drawString("3D PIG", gfx.width() / 2, 6);
   renderPig3D(gfx, gfx.width() / 2, gfx.height() / 2 + 10, 60.0f, rotX, rotY, 0);
-  char buf[64];
-  gfx.setTextDatum(BC_DATUM);
-  gfx.setTextColor(0xFFFF, TFT_BLACK);
-  gfx.setTextSize(1);
-  if (imuOK) {
-    snprintf(buf, sizeof(buf), "TILT aX=%.2f aY=%.2f", ax, ay);
-    gfx.drawString(buf, gfx.width() / 2, gfx.height() - 4);
-  } else {
-    gfx.setTextColor(0xF800, TFT_BLACK);
-    gfx.drawString("IMU not found", gfx.width() / 2, gfx.height() - 4);
-  }
   drawViewButton(gfx);
   WiFiFood::draw(gfx, gfx.width()/2, gfx.height()/2, 60, TFT_BLACK);
 }
@@ -498,7 +611,6 @@ void updateIMU() {
   float targetRotY = -atan2(ax, az);
   rotX += (targetRotX - rotX) * 0.15f;
   rotY += (targetRotY - rotY) * 0.15f;
-  // IMU 傾斜只在無觸控且無飛蟲時才影響視線
   if (currentView == 0 && !eyes.touching && FlyBug::activeCount() == 0) {
     float tiltX = constrain(ax * 1.8f, -1.0f, 1.0f);
     float tiltY = constrain(ay * 1.8f, -1.0f, 1.0f);
@@ -518,33 +630,107 @@ void processIMUEvents(unsigned long now) {
     peakCount++; lastPeak = now;
   }
   if (peakCount >= 5) {
+    habits.shakes++;
+    jumpUntil = 0;
+    yayUntil = 0;
     dizzyUntil = now + 3000;
     peakCount = 0; lastMotion = now;
-    setMood(EMO_DIZZY, 3000);
+    setMoodForced(EMO_DIZZY, 3000);
+    Serial.printf("[🌀] DIZZY (shakes=%d)\n", habits.shakes);
   } else if (now >= dizzyUntil && peakCount >= 1 &&
              (now - lastPeak) > 400 && (now - lastFlick) > 700) {
-    exprIndex = (exprIndex + 1) % EXPR_COUNT;
-    setMood(exprCycle[exprIndex], 0);
+    int r = random(100);
+    if (r < 30)      setMood(EMO_SURPRISED, 800);
+    else if (r < 60) setMood(EMO_HAPPY, 1000);
+    else if (r < 85) setMood(EMO_SHY, 1200);
+    else             setMood(EMO_ANNOYED, 1000);
     lastFlick = now; peakCount = 0; lastMotion = now;
   }
+}
+
+// ============================================================
+// 🧠 無聊行為
+// ============================================================
+void updateIdleBehavior(unsigned long now) {
+  if (currentView != 0) return;
+  if (FlyBug::activeCount() > 0) return;
+  if (eyes.touching) return;
+  if (eyes.mood == EMO_SLEEPING || eyes.mood == EMO_DIZZY ||
+      eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT ||
+      eyes.mood == EMO_ANNOYED || eyes.mood == EMO_HAPPY ||
+      eyes.mood == EMO_LOVE || eyes.mood == EMO_SHY ||
+      eyes.mood == EMO_PROUD) return;
+
+  if (now - lastInteraction < 5000) return;
+  if (now < nextIdleAction) return;
+
+  int r = random(100);
+
+  if (loveMeter < 20) {
+    if (r < 60) {
+      eyes.targetLookX = random(-80, 81) / 100.0f;
+      eyes.targetLookY = random(-40, 41) / 100.0f;
+      Serial.println("[🧠] Look around");
+    } else if (r < 80) {
+      eyes.blinking = true;
+      eyes.blinkStart = now;
+    }
+  } else {
+    if (r < 30) {
+      eyes.targetLookX = random(-80, 81) / 100.0f;
+      eyes.targetLookY = random(-40, 41) / 100.0f;
+      Serial.println("[🧠] Look around");
+    } else if (r < 50) {
+      setMood(EMO_SQUINT, 1500);
+      Serial.println("[🧠] Yawn");
+    } else if (r < 65) {
+      setMood(EMO_THINKING, 2000);
+      Serial.println("[🧠] Thinking");
+    } else if (r < 80) {
+      setMood(EMO_HAPPY, 1200);
+      Serial.println("[🧠] Happy peek");
+    } else if (r < 90) {
+      setMood(EMO_SQUINT, 2500);
+      Serial.println("[🧠] Sleepy yawn");
+    } else {
+      eyes.targetLookX = 0;
+      eyes.targetLookY = 0;
+      Serial.println("[🧠] Look at you");
+    }
+  }
+
+  nextIdleAction = now + random(3000, 8000);
 }
 
 void updateMoodState(unsigned long now) {
   uint32_t still = now - lastMotion;
   DeskMood prevMood = currentMood;
-  if (still < AWAKE_MS)       currentMood = MOOD_AWAKE;
-  else if (still < SLEEPY_MS) currentMood = MOOD_SLEEPY;
-  else                        currentMood = MOOD_ASLEEP;
+
+  uint32_t awakeLimit  = isDay ? AWAKE_MS  : (AWAKE_MS  / 2);
+  uint32_t sleepyLimit = isDay ? SLEEPY_MS : (SLEEPY_MS / 2);
+
+  if (still < awakeLimit)       currentMood = MOOD_AWAKE;
+  else if (still < sleepyLimit) currentMood = MOOD_SLEEPY;
+  else                          currentMood = MOOD_ASLEEP;
+
+  // ★ 從睡眠醒來 → 起床氣窗口
+  if (prevMood == MOOD_ASLEEP && currentMood != MOOD_ASLEEP) {
+    wakeRageUntil = now + 3000;
+    Serial.println("[😾] Wake rage window open");
+  }
 
   if (eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT ||
-      eyes.mood == EMO_ANNOYED) return;
+      eyes.mood == EMO_ANNOYED || eyes.mood == EMO_DIZZY) return;
 
   if (currentMood == MOOD_ASLEEP && prevMood != MOOD_ASLEEP) {
     setMood(EMO_SLEEPING, 0);
   } else if (currentMood == MOOD_SLEEPY && prevMood == MOOD_AWAKE) {
     if (eyes.mood != EMO_SLEEPING) setMood(EMO_SQUINT, 0);
   } else if (currentMood == MOOD_AWAKE && prevMood != MOOD_AWAKE) {
-    setMood(EMO_SURPRISED, 800);
+    int r = random(100);
+    if (r < 50)      setMood(EMO_SURPRISED, 800);
+    else if (r < 80) setMood(EMO_SQUINT, 600);
+    else             setMood(EMO_ANNOYED, 800);
   }
 }
 
@@ -566,6 +752,7 @@ void initEyes(LovyanGFX& gfx) {
   eyes.left.targetLid = eyes.right.targetLid = 1.0f;
   eyes.nextBlink = millis() + random(2500, 5000);
   for (int i = 0; i < MAX_PARTICLES; i++) eyes.particles[i].active = false;
+  for (int i = 0; i < MAX_FIRE; i++) fireP[i].active = false;
   eyes.initialized = true;
 }
 
@@ -611,6 +798,15 @@ void drawParticles(LovyanGFX& gfx) {
 }
 
 void setMood(EyeMood m, unsigned long durationMs) {
+  int newPri = moodPriority(m);
+  int curPri = moodPriority(eyes.mood);
+
+  if (curPri > newPri && eyes.moodEnd > millis() && eyes.mood != EMO_NEUTRAL) {
+    Serial.printf("[Mood] %s(x%d) rejected by %s(x%d)\n",
+                  moodName(m), newPri, moodName(eyes.mood), curPri);
+    return;
+  }
+
   if (m != eyes.lastMood) {
     switch (m) {
       case EMO_HAPPY:     spawnParticles(PIG_PINK, 6); break;
@@ -622,6 +818,8 @@ void setMood(EyeMood m, unsigned long durationMs) {
       case EMO_COLD:      spawnParticles(0x07FF, 10); break;
       case EMO_HEAT:      spawnParticles(0xF800, 10); break;
       case EMO_ANNOYED:   spawnParticles(0x7BEF, 5); break;
+      case EMO_SHY:       spawnParticles(0xF81F, 5); break;
+      case EMO_PROUD:     spawnParticles(0xFFE0, 15); break;
       default: break;
     }
     eyes.lastMood = m;
@@ -684,7 +882,21 @@ void setMood(EyeMood m, unsigned long durationMs) {
       eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.0f;
       eyes.left.targetLid = eyes.right.targetLid = 0.45f;
       break;
+    case EMO_SHY:
+      eyes.targetColor = 0xFBE0;
+      eyes.left.targetPupilScale = eyes.right.targetPupilScale = 0.85f;
+      eyes.left.targetLid = eyes.right.targetLid = 0.55f;
+      break;
+    case EMO_PROUD:
+      eyes.targetColor = 0xFFE0;
+      eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.15f;
+      eyes.left.targetLid = eyes.right.targetLid = 1.0f;
+      break;
   }
+}
+
+void setMoodForced(EyeMood m, unsigned long durationMs) {
+  setMood(m, durationMs);
 }
 
 void lookAt(int tx, int ty) {
@@ -695,13 +907,71 @@ void lookAt(int tx, int ty) {
 }
 
 void onTouchStart(int16_t tx, int16_t ty) {
+  habits.touches++;
   eyes.touching = true;
   eyes.touchStart = millis();
   eyes.touchX = tx; eyes.touchY = ty;
   lookAt(tx, ty);
   eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.15f;
+
   unsigned long now = millis();
-  if (now - eyes.lastTapMs < 400) setMood(EMO_SURPRISED, 500);
+  bool wasLongAbsent = (now - lastInteraction > 30000) && (lastInteraction > 0);
+  lastInteraction = now;
+
+  // ★ 打招呼：超過 30 秒沒互動，再摸會超開心
+  if (wasLongAbsent || welcomeMode) {
+    welcomeMode = true;
+    welcomeUntil = now + 2000;
+    loveMeter += 0.3f;
+    if (loveMeter > 100) loveMeter = 100;
+    setMoodForced(EMO_HAPPY, 2000);
+    spawnParticles(0xF81F, 10);
+    spawnParticles(0xFFE0, 10);
+    Serial.println("[🐶] WELCOME BACK!");
+    eyes.lastTapMs = now;
+    return;
+  }
+
+  // ★ 起床氣
+  if (now < wakeRageUntil) {
+    int r = random(100);
+    if (r < 60) {
+      setMoodForced(EMO_ANGRY, 1500);
+      Serial.println("[😠] DON'T WAKE ME!");
+    } else if (r < 85) {
+      setMoodForced(EMO_ANNOYED, 1500);
+      Serial.println("[😒] Ugh...");
+    } else {
+      Serial.println("[💤] ...zzz... (pretending)");
+    }
+    wakeRageUntil = 0;
+    eyes.lastTapMs = now;
+    return;
+  }
+
+  // ★ 愛意值增加
+  loveMeter += 0.05f;
+  if (loveMeter > 100) loveMeter = 100;
+
+  // ★ 手指追蹤
+  fingerX = tx;
+  fingerY = ty;
+  fingerTracking = true;
+  fingerTrackEnd = now + 300;
+
+  // 雙擊判斷
+  if (now - eyes.lastTapMs < 400) {
+    int r = random(100);
+    if (loveMeter > 50) {
+      if (r < 40)      setMood(EMO_LOVE, 1500);
+      else if (r < 70) setMood(EMO_HAPPY, 1200);
+      else             setMood(EMO_SHY, 1000);
+    } else {
+      if (r < 60)      setMood(EMO_SURPRISED, 500);
+      else if (r < 90) setMood(EMO_SHY, 600);
+      else             setMood(EMO_HAPPY, 800);
+    }
+  }
   eyes.lastTapMs = now;
 }
 
@@ -738,42 +1008,31 @@ void drawPigBody(LovyanGFX& gfx, int bounceY = 0) {
   gfx.fillEllipse(cx+r-16, cy+14, 11, 6, lerpColor(eyes.color, PIG_BLUSH, 0.6f));
 }
 
-// ★ 改進版：眼球移動更多、瞳孔分離、飛蟲近時雙高光
 void drawEyeNormal(LovyanGFX& gfx, Eye& e) {
   int visibleH = (int)(e.h * e.lidOpen);
   if (visibleH < 3) visibleH = 3;
-
   bool hasFly = FlyBug::activeCount() > 0;
   float eyeMoveMul   = hasFly ? 10.0f : 6.0f;
   float pupilMoveMul = hasFly ? 7.0f  : 4.0f;
-
   int cx = e.cx + (int)(eyes.lookX * eyeMoveMul);
   int cy = e.cy + (int)(eyes.lookY * (eyeMoveMul * 0.7f));
   int hw = e.w / 2, hh = visibleH / 2;
   int radius = min(hw, hh) / 2;
   if (radius < 2) radius = 2;
-
   gfx.fillRoundRect(cx-hw-2, cy-hh-2, e.w+4, visibleH+4, radius+2, eyes.bgColor);
   gfx.fillRoundRect(cx-hw, cy-hh, e.w, visibleH, radius, PIG_EYE_WHITE);
-
   if (visibleH > 8) {
     int pupilR = (int)(min(hw, hh) * 0.55f * e.pupilScale);
-
     int px = cx + (int)(eyes.lookX * pupilMoveMul);
     int py = cy + (int)(eyes.lookY * (pupilMoveMul * 0.7f));
-
-    // 瞳孔限制在眼白内
     int maxOffsetX = hw - pupilR;
     int maxOffsetY = visibleH/2 - pupilR;
     if (px - cx > maxOffsetX) px = cx + maxOffsetX;
     if (px - cx < -maxOffsetX) px = cx - maxOffsetX;
     if (py - cy > maxOffsetY) py = cy + maxOffsetY;
     if (py - cy < -maxOffsetY) py = cy - maxOffsetY;
-
     gfx.fillCircle(px, py, pupilR, PIG_EYE_BLACK);
     gfx.fillCircle(px - pupilR/3, py - pupilR/3, pupilR/3, PIG_EYE_WHITE);
-
-    // 飞虫近时第二高光
     if (hasFly && e.pupilScale > 1.15f) {
       gfx.fillCircle(px + pupilR/3, py + pupilR/4, pupilR/5, PIG_EYE_WHITE);
     }
@@ -838,9 +1097,7 @@ void drawEyeHeat(LovyanGFX& gfx, Eye& e) {
 void drawEyeAnnoyed(LovyanGFX& gfx, Eye& e, bool isRight) {
   int cx = e.cx, cy = e.cy;
   int hw = e.w / 2, hh = e.h / 2;
-
   gfx.fillRoundRect(cx - hw, cy - 2, e.w, 5, 2, PIG_EYE_BLACK);
-
   int browY = cy - hh - 6;
   int browInnerX = cx + (isRight ? -12 : 12);
   int browOuterX = cx + (isRight ? 12 : -12);
@@ -849,6 +1106,32 @@ void drawEyeAnnoyed(LovyanGFX& gfx, Eye& e, bool isRight) {
   for (int i = 0; i < 3; i++) {
     gfx.drawLine(browInnerX, browInnerY + i,
                  browOuterX, browOuterY + i, PIG_EYE_BLACK);
+  }
+}
+
+void drawEyeShy(LovyanGFX& gfx, Eye& e) {
+  int cx = e.cx, cy = e.cy + 6;
+  int hw = e.w / 2;
+  gfx.fillRoundRect(cx-hw, cy-8, e.w, 16, 4, eyes.bgColor);
+  gfx.fillRoundRect(cx-hw, cy-8, e.w, 16, 4, PIG_EYE_WHITE);
+  gfx.fillCircle(cx, cy + 2, 6, PIG_EYE_BLACK);
+  gfx.fillCircle(cx-2, cy, 2, PIG_EYE_WHITE);
+}
+
+void drawEyeProud(LovyanGFX& gfx, Eye& e) {
+  int cx = e.cx, cy = e.cy;
+  gfx.fillCircle(cx, cy, e.w/2, PIG_EYE_WHITE);
+  gfx.fillCircle(cx, cy - 1, 9, PIG_EYE_BLACK);
+  gfx.fillCircle(cx - 3, cy - 4, 3, PIG_EYE_WHITE);
+  gfx.fillCircle(cx + 3, cy + 2, 2, PIG_EYE_WHITE);
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    float a = (now / 200.0 + i * 90) * DEG_TO_RAD;
+    int sx = cx + (int)(cos(a) * 12);
+    int sy = cy + (int)(sin(a) * 12);
+    gfx.drawPixel(sx, sy, 0xFFE0);
+    gfx.drawPixel(sx+1, sy, 0xFFE0);
+    gfx.drawPixel(sx, sy+1, 0xFFE0);
   }
 }
 
@@ -866,7 +1149,6 @@ void drawColdEffect(LovyanGFX& gfx) {
   int mY = eyes.pig.cy + eyes.pig.r - 26 + chatter;
   gfx.drawLine(eyes.pig.cx - 10, mY, eyes.pig.cx + 10, mY, PIG_EYE_BLACK);
   gfx.drawLine(eyes.pig.cx - 10, mY + 3, eyes.pig.cx + 10, mY + 3, PIG_EYE_BLACK);
-
   gfx.setTextDatum(MC_DATUM);
   gfx.setTextColor(0x07FF, eyes.bgColor);
   gfx.setTextSize(2);
@@ -875,6 +1157,56 @@ void drawColdEffect(LovyanGFX& gfx) {
 
 void drawHeatEffect(LovyanGFX& gfx) {
   unsigned long now = millis();
+  int mouthX = eyes.pig.cx;
+  int mouthY = eyes.pig.cy + eyes.pig.r - 22;
+
+  static uint32_t lastSpawn = 0;
+  if (now - lastSpawn > 35) {
+    lastSpawn = now;
+    int spawnCount = random(2, 4);
+    for (int k = 0; k < spawnCount; k++) {
+      for (int i = 0; i < MAX_FIRE; i++) {
+        if (fireP[i].active) continue;
+        fireP[i].x = mouthX + random(-4, 5);
+        fireP[i].y = mouthY + random(-3, 4);
+        float angle = random(0, 628) / 100.0f;
+        float speed = random(20, 60) / 10.0f;
+        fireP[i].vx = cosf(angle) * speed;
+        fireP[i].vy = sinf(angle) * speed - 0.6f;
+        fireP[i].life = random(20, 40);
+        fireP[i].active = true;
+        break;
+      }
+    }
+  }
+
+  for (int i = 0; i < MAX_FIRE; i++) {
+    if (!fireP[i].active) continue;
+    fireP[i].x += fireP[i].vx;
+    fireP[i].y += fireP[i].vy;
+    fireP[i].vy -= 0.08f;
+    fireP[i].vx *= 0.97f;
+    fireP[i].vy *= 0.97f;
+    fireP[i].life--;
+    if (fireP[i].life <= 0) fireP[i].active = false;
+  }
+
+  for (int i = 0; i < MAX_FIRE; i++) {
+    if (!fireP[i].active) continue;
+    int l = fireP[i].life;
+    uint16_t c;
+    if (l > 30)      c = 0xFFFF;
+    else if (l > 22) c = 0xFFE0;
+    else if (l > 15) c = 0xFD20;
+    else if (l > 8)  c = 0xFBE0;
+    else             c = 0xF800;
+    int size = (l > 28) ? 3 : (l > 15 ? 2 : 1);
+    gfx.fillCircle(fireP[i].x, fireP[i].y, size, c);
+    if (l > 18 && size >= 2) {
+      gfx.fillCircle(fireP[i].x, fireP[i].y, size - 1, 0xFFFF);
+    }
+  }
+
   for (int i = 0; i < 4; i++) {
     float t = fmod(now / 1200.0f + i * 0.25f, 1.0f);
     int sx = eyes.pig.cx - 45 + i * 30;
@@ -883,17 +1215,6 @@ void drawHeatEffect(LovyanGFX& gfx) {
     gfx.fillCircle(sx, sy, 3, 0x5D9B);
     gfx.fillTriangle(sx-3, sy, sx+3, sy, sx, sy-6, 0x5D9B);
   }
-  for (int i = 0; i < 5; i++) {
-    int wx = eyes.pig.cx - 48 + i * 24;
-    int wy = eyes.pig.cy - eyes.pig.r - 5 + (int)(sin(now / 150.0 + i) * 3);
-    uint16_t c = (i % 2 == 0) ? 0xFBE0 : 0xFC00;
-    gfx.drawLine(wx-3, wy, wx+3, wy-2, c);
-    gfx.drawLine(wx+3, wy-2, wx-3, wy-4, c);
-  }
-  int mouthY = eyes.pig.cy + eyes.pig.r - 22;
-  int mouthW = 9 + (int)(sin(now / 200.0) * 3);
-  gfx.fillEllipse(eyes.pig.cx, mouthY, mouthW, 5, PIG_EYE_BLACK);
-  gfx.fillEllipse(eyes.pig.cx, mouthY + 2, mouthW*0.6f, 3, 0xF800);
 
   gfx.setTextDatum(MC_DATUM);
   gfx.setTextColor(0xF800, eyes.bgColor);
@@ -903,34 +1224,47 @@ void drawHeatEffect(LovyanGFX& gfx) {
 
 void drawAnnoyedEffect(LovyanGFX& gfx) {
   unsigned long now = millis();
-
   gfx.setTextDatum(MC_DATUM);
   gfx.setTextColor(0xFBE0, eyes.bgColor);
   gfx.setTextSize(2);
   float wobble = sin(now / 100.0) * 2;
   gfx.drawString("ANNOYED...", eyes.pig.cx + wobble, EFFECT_TEXT_Y);
-
   float wavePhase = sin(now / 150.0);
   int handX = eyes.pig.cx + eyes.pig.r - 10 + (int)(wavePhase * 8);
   int handY = eyes.pig.cy + 20;
   gfx.fillCircle(handX, handY, 6, PIG_PINK);
   gfx.drawCircle(handX, handY, 6, PIG_PINK_DARK);
-  for (int i = 0; i < 3; i++) {
-    gfx.drawLine(handX + 4, handY - 2 + i * 2,
-                 handX + 9, handY - 3 + i * 2, PIG_PINK_DARK);
-  }
-
   int handX2 = eyes.pig.cx - eyes.pig.r + 10 - (int)(wavePhase * 8);
   int handY2 = eyes.pig.cy + 20;
   gfx.fillCircle(handX2, handY2, 6, PIG_PINK);
   gfx.drawCircle(handX2, handY2, 6, PIG_PINK_DARK);
-  for (int i = 0; i < 3; i++) {
-    gfx.drawLine(handX2 - 4, handY2 - 2 + i * 2,
-                 handX2 - 9, handY2 - 3 + i * 2, PIG_PINK_DARK);
-  }
+}
 
-  if ((now / 500) % 2 == 0) {
-    gfx.fillCircle(eyes.pig.cx + 50, eyes.pig.cy - 40, 2, 0x5D9B);
+void drawShyEffect(LovyanGFX& gfx) {
+  unsigned long now = millis();
+  gfx.setTextDatum(MC_DATUM);
+  gfx.setTextColor(0xF81F, eyes.bgColor);
+  gfx.setTextSize(2);
+  float wobble = sin(now / 200.0) * 2;
+  gfx.drawString("...///", eyes.pig.cx + wobble, EFFECT_TEXT_Y);
+  int blushOffset = (int)(sin(now / 200.0) * 2);
+  gfx.fillEllipse(eyes.pig.cx - eyes.pig.r + 16,
+                  eyes.pig.cy + 14 + blushOffset, 14, 8, 0xF800);
+  gfx.fillEllipse(eyes.pig.cx + eyes.pig.r - 16,
+                  eyes.pig.cy + 14 + blushOffset, 14, 8, 0xF800);
+}
+
+void drawProudEffect(LovyanGFX& gfx) {
+  unsigned long now = millis();
+  gfx.setTextDatum(MC_DATUM);
+  gfx.setTextColor(0xFFE0, eyes.bgColor);
+  gfx.setTextSize(2);
+  float wobble = sin(now / 150.0) * 3;
+  gfx.drawString("* PROUD *", eyes.pig.cx + wobble, EFFECT_TEXT_Y);
+  int cy = eyes.pig.cy - eyes.pig.r - 8;
+  for (int i = 0; i < 3; i++) {
+    int px = eyes.pig.cx - 20 + i * 20;
+    gfx.fillTriangle(px - 6, cy, px + 6, cy, px, cy - 12, 0xFFE0);
   }
 }
 
@@ -1034,12 +1368,77 @@ void drawGlow(LovyanGFX& gfx) {
   }
 }
 
-void drawEyes(LovyanGFX& gfx) {
-  gfx.fillRect(0, 0, gfx.width(), gfx.height(), eyes.bgColor);
-  eyes.pig.bounce = sin(eyes.breathPhase) * 2.5f;
-  int bounceY = (int)eyes.pig.bounce;
+void drawCelestialBody(LovyanGFX& gfx) {
+  int sx = 210, sy = 16;
+  if (isDay) {
+    gfx.fillCircle(sx, sy, 6, 0xFD20);
+    for (int i = 0; i < 8; i++) {
+      float a = i * 45 * DEG_TO_RAD;
+      gfx.drawLine(sx + cos(a) * 7, sy + sin(a) * 7,
+                   sx + cos(a) * 10, sy + sin(a) * 10, 0xFFE0);
+    }
+  } else {
+    gfx.fillCircle(sx, sy, 7, 0xFFEC);
+    gfx.fillCircle(sx + 4, sy - 2, 6, eyes.bgColor);
+    gfx.drawPixel(sx - 8, sy - 4, 0xFFFF);
+    gfx.drawPixel(sx + 8, sy + 4, 0xFFFF);
+  }
+}
 
-  // ★ 豬頭大幅轉向飛蟲方向（帶平滑）
+// ★ 愛意值指示燈
+void drawLoveMeter(LovyanGFX& gfx) {
+  int lx = 300, ly = 42;
+  // 背景
+  gfx.drawCircle(lx, ly, 5, 0x5D9B);
+  // 填充
+  int fillR = (int)(5 * (loveMeter / 100.0f));
+  if (fillR > 0) {
+    uint16_t c = (loveMeter > 50) ? 0xF81F :
+                 (loveMeter > 20) ? 0xFFE0 :
+                                    0x7BEF;
+    gfx.fillCircle(lx, ly, fillR, c);
+  }
+  // 打招呼時加個心
+  if (welcomeMode) {
+    gfx.fillCircle(lx - 3, ly - 3, 2, 0xF81F);
+    gfx.fillCircle(lx + 3, ly - 3, 2, 0xF81F);
+    gfx.fillTriangle(lx - 5, ly - 2, lx + 5, ly - 2, lx, ly + 5, 0xF81F);
+  }
+}
+
+void drawEyes(LovyanGFX& gfx) {
+  uint16_t skyColor = getSkyColor();
+  gfx.fillRect(0, 0, gfx.width(), gfx.height(), skyColor);
+  eyes.bgColor = skyColor;
+
+  if (!isDay) {
+    unsigned long now = millis();
+    static int starSeedX[20], starSeedY[20];
+    static bool seeded = false;
+    if (!seeded) {
+      for (int i = 0; i < 20; i++) {
+        starSeedX[i] = random(10, 310);
+        starSeedY[i] = random(40, 180);
+      }
+      seeded = true;
+    }
+    for (int i = 0; i < 20; i++) {
+      int twinkle = (now / 200 + i * 37) % 4;
+      if (twinkle == 0) continue;
+      gfx.drawPixel(starSeedX[i], starSeedY[i], 0xFFFF);
+    }
+  }
+
+  int jumpOffset = 0;
+  bool isDizzyNow = (eyes.mood == EMO_DIZZY);
+  if (!isDizzyNow && millis() < jumpUntil) {
+    float t = (jumpUntil - millis()) / 500.0f;
+    jumpOffset = -(int)(sinf((1.0f - t) * PI) * 8);
+  }
+
+  eyes.pig.bounce = sin(eyes.breathPhase) * 2.5f;
+  int bounceY = (int)eyes.pig.bounce + jumpOffset;
+
   int headOffsetX = 0;
   int headOffsetY = 0;
   if (FlyBug::activeCount() > 0) {
@@ -1062,8 +1461,7 @@ void drawEyes(LovyanGFX& gfx) {
 
   static int dizzyOffsetX = 0;
   static int dizzyOffsetY = 0;
-  bool isDizzy = (eyes.mood == EMO_DIZZY);
-  if (isDizzy) {
+  if (isDizzyNow) {
     unsigned long now = millis();
     dizzyOffsetX = (int)(sin(now / 80.0) * 6);
     dizzyOffsetY = (int)(cos(now / 60.0) * 3);
@@ -1099,18 +1497,23 @@ void drawEyes(LovyanGFX& gfx) {
       drawEyeAnnoyed(gfx, eyes.left, false);
       drawEyeAnnoyed(gfx, eyes.right, true);
       drawAnnoyedEffect(gfx); break;
+    case EMO_SHY:
+      drawEyeShy(gfx, eyes.left); drawEyeShy(gfx, eyes.right);
+      drawShyEffect(gfx); break;
+    case EMO_PROUD:
+      drawEyeProud(gfx, eyes.left); drawEyeProud(gfx, eyes.right);
+      drawProudEffect(gfx); break;
     default:
       drawEyeNormal(gfx, eyes.left); drawEyeNormal(gfx, eyes.right); break;
   }
   drawParticles(gfx);
 
-  if (isDizzy) {
+  if (isDizzyNow) {
     eyes.pig.cx -= dizzyOffsetX; eyes.pig.cy -= dizzyOffsetY;
     eyes.left.cx -= dizzyOffsetX; eyes.right.cx -= dizzyOffsetX;
     eyes.left.cy -= dizzyOffsetY; eyes.right.cy -= dizzyOffsetY;
   }
 
-  // 恢復豬頭偏移
   if (FlyBug::activeCount() > 0) {
     eyes.pig.cx -= headOffsetX;
     eyes.pig.cy -= headOffsetY;
@@ -1126,6 +1529,8 @@ void drawEyes(LovyanGFX& gfx) {
     FlyBug::draw(gfx);
   }
 
+  drawCelestialBody(gfx);
+  drawLoveMeter(gfx);
   drawViewButton(gfx);
   drawBottomButtons(gfx);
 }
@@ -1138,9 +1543,11 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
                   eyes.mood == EMO_LOVE || eyes.mood == EMO_DIZZY ||
                   eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT ||
                   eyes.mood == EMO_ANNOYED ||
+                  eyes.mood == EMO_SHY || eyes.mood == EMO_PROUD ||
                   WiFiFood::getPhase() == WiFiFood::PHASE_EATING ||
                   WiFiFood::getPhase() == WiFiFood::PHASE_DIGESTING ||
-                  FlyBug::activeCount() > 0;
+                  FlyBug::activeCount() > 0 ||
+                  fingerTracking || welcomeMode;
   unsigned long interval = isActive ? 33 : 80;
   if (now - lastEyeUpdate < interval) return;
   lastEyeUpdate = now;
@@ -1153,48 +1560,55 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
   eyes.breathPhase += (eyes.mood == EMO_NEUTRAL || eyes.mood == EMO_HAPPY ||
                        eyes.mood == EMO_FOCUS) ? 0.08f : 0.05f;
 
-  // ★★★ 飛蟲追蹤 v2：逐帧 + 瞳孔縮放 + 鎖定
+  if (eyes.mood == EMO_HAPPY && eyes.moodEnd > 0 &&
+      eyes.moodEnd - millis() > 1500 &&
+      eyes.mood != EMO_DIZZY) {
+    yayUntil = millis() + 300;
+  }
+  if (now < yayUntil && eyes.mood != EMO_DIZZY) {
+    eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.4f;
+  }
+
+  // ★ 手指追蹤（優先於飛蟲）
+  if (fingerTracking && !eyes.touching) {
+    int dx = fingerX - eyes.pig.cx;
+    int dy = fingerY - eyes.pig.cy;
+    eyes.targetLookX = constrain(dx / 80.0f, -1.0f, 1.0f);
+    eyes.targetLookY = constrain(dy / 80.0f, -1.0f, 1.0f);
+    needRedraw = true;
+  }
+
+  // 飛蟲追蹤
   int flyX, flyY;
   bool hasFly = FlyBug::getNearestFly(eyes.pig.cx, eyes.pig.cy, flyX, flyY);
-
   if (hasFly) {
     flyLockUntil = now + 500;
-    flyLockX = flyX;
-    flyLockY = flyY;
+    flyLockX = flyX; flyLockY = flyY;
     int dx = flyX - eyes.pig.cx;
     int dy = flyY - eyes.pig.cy;
     flyDistance = sqrtf(dx * dx + dy * dy);
-
     float lx = constrain(dx / 40.0f, -1.3f, 1.3f);
     float ly = constrain(dy / 40.0f, -1.3f, 1.3f);
-
     eyes.targetLookX = lx;
     eyes.targetLookY = ly;
-
-    // ★ 瞳孔放大（近距離專注）
     float targetPupil = 1.0f;
     if (flyDistance < 50)      targetPupil = 1.25f;
     else if (flyDistance < 80) targetPupil = 1.1f;
     eyes.left.targetPupilScale  = targetPupil;
     eyes.right.targetPupilScale = targetPupil;
-
     needRedraw = true;
   } else {
     flyDistance = 999;
   }
 
-  // 平滑插值：飛蟲模式更快
   float lerp = 0.2f;
   if (hasFly) lerp = 0.5f;
-
   if (abs(eyes.lookX - eyes.targetLookX) > 0.005f) {
     eyes.lookX += (eyes.targetLookX - eyes.lookX) * lerp; needRedraw = true;
   }
   if (abs(eyes.lookY - eyes.targetLookY) > 0.005f) {
     eyes.lookY += (eyes.targetLookY - eyes.lookY) * lerp; needRedraw = true;
   }
-
-  // 瞳孔縮放平滑
   for (auto* e : {&eyes.left, &eyes.right}) {
     if (abs(e->pupilScale - e->targetPupilScale) > 0.01f) {
       float pScale = hasFly ? 0.25f : 0.15f;
@@ -1203,32 +1617,20 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
     }
   }
 
-  // 飛蟲出現 → 自動 ANNOYED
   static bool flyAnnoyed = false;
-  if (FlyBug::activeCount() > 0 &&
-      eyes.mood != EMO_ANNOYED &&
-      eyes.mood != EMO_COLD && eyes.mood != EMO_HEAT &&
-      eyes.mood != EMO_DIZZY && eyes.mood != EMO_SLEEPING &&
-      !eyes.touching) {
-    if (!flyAnnoyed) {
-      setMood(EMO_ANNOYED, 0);
-      flyAnnoyed = true;
-      needRedraw = true;
-    }
+  if (FlyBug::activeCount() > 0 && !flyAnnoyed && !eyes.touching) {
+    setMood(EMO_ANNOYED, 0);
+    flyAnnoyed = true;
   } else if (FlyBug::activeCount() == 0 && flyAnnoyed) {
-    if (eyes.mood == EMO_ANNOYED) {
-      setMood(EMO_NEUTRAL, 0);
-    }
     flyAnnoyed = false;
-    needRedraw = true;
   }
 
   if (eyes.touching && now - eyes.touchStart > 1500) {
-    if (eyes.mood != EMO_SQUINT) { setMood(EMO_SQUINT, 0); needRedraw = true; }
+    if (eyes.mood != EMO_SQUINT) setMood(EMO_SQUINT, 0);
   }
   if (eyes.touching && now - eyes.touchStart > 3000 &&
       eyes.mood != EMO_DIZZY) {
-    setMood(EMO_DIZZY, 3000); needRedraw = true;
+    setMoodForced(EMO_DIZZY, 3000);
   }
   if (!eyes.blinking && now >= eyes.nextBlink &&
       eyes.mood != EMO_SLEEPING && eyes.mood != EMO_HAPPY &&
@@ -1254,7 +1656,7 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
       needRedraw = true;
     }
   }
-  if (eyes.mood == EMO_NEUTRAL && !eyes.typingActive && !eyes.touching && !hasFly) {
+  if (eyes.mood == EMO_NEUTRAL && !eyes.typingActive && !eyes.touching && !hasFly && !fingerTracking) {
     float breath = sin(eyes.breathPhase) * 0.02f;
     eyes.left.targetPupilScale = eyes.right.targetPupilScale = 1.0f + breath;
   }
@@ -1282,9 +1684,18 @@ void updateEyes(LovyanGFX& gfx, unsigned long now) {
       eyes.mood == EMO_DIZZY ||
       eyes.mood == EMO_COLD || eyes.mood == EMO_HEAT ||
       eyes.mood == EMO_ANNOYED ||
+      eyes.mood == EMO_SHY || eyes.mood == EMO_PROUD ||
       WiFiFood::isScanning() ||
       WiFiFood::getPhase() == WiFiFood::PHASE_TOILET ||
-      FlyBug::activeCount() > 0) needRedraw = true;
+      FlyBug::activeCount() > 0 ||
+      fingerTracking || welcomeMode) needRedraw = true;
+
+  if (eyes.mood == EMO_HEAT) {
+    bool anyFire = false;
+    for (int i = 0; i < MAX_FIRE; i++)
+      if (fireP[i].active) { anyFire = true; break; }
+    if (anyFire) needRedraw = true;
+  }
 
   static int breathFrame = 0;
   if (eyes.mood == EMO_NEUTRAL || eyes.mood == EMO_HAPPY || eyes.mood == EMO_FOCUS) {
@@ -1307,6 +1718,63 @@ void handleTouch(unsigned long now) {
       touchDownTime = now;
       lastMotion = now;
 
+      // 打死飛蟲
+      if (currentView == 0 && !WiFiFood::isInToilet() &&
+          eyes.mood != EMO_DIZZY &&
+          eyes.mood != EMO_COLD &&
+          eyes.mood != EMO_HEAT) {
+        int flyIdx = FlyBug::hitTest(tx, ty, 20);
+        if (flyIdx >= 0) {
+          FlyBug::killFly(flyIdx);
+          habits.fliesKilled++;
+          loveMeter += 5;
+          if (loveMeter > 100) loveMeter = 100;
+
+          int r = random(100);
+          if (r < 70) {
+            setMoodForced(EMO_HAPPY, 2500);
+            spawnParticles(0xF81F, 8);
+            spawnParticles(0xFFE0, 8);
+            spawnParticles(0x07FF, 8);
+            spawnParticles(0x07E0, 6);
+            jumpUntil = millis() + 500;
+            yayUntil = millis() + 300;
+          } else if (r < 88) {
+            setMoodForced(EMO_LOVE, 2000);
+          } else if (r < 96) {
+            setMoodForced(EMO_PROUD, 2500);
+          } else {
+            setMoodForced(EMO_SHY, 1500);
+          }
+
+          Serial.printf("[🐷] Fly killed! total=%d love=%.1f\n",
+                        habits.fliesKilled, loveMeter);
+
+          if (habits.fliesKilled >= 10 && !eggFlies10) {
+            eggFlies10 = true;
+            setMoodForced(EMO_PROUD, 3000);
+            spawnParticles(0xFFE0, 20);
+            Serial.println("🥚 EGG: 10 flies killed! PROUD!");
+          }
+          if (habits.fliesKilled >= 25 && !eggFlies25) {
+            eggFlies25 = true;
+            setMoodForced(EMO_LOVE, 3000);
+            spawnParticles(0xF81F, 20);
+            Serial.println("🥚 EGG: 25 flies killed!");
+          }
+          if (habits.fliesKilled >= 50 && !eggFlies50) {
+            eggFlies50 = true;
+            setMoodForced(EMO_HAPPY, 5000);
+            spawnParticles(0xFFE0, 20);
+            spawnParticles(0xF81F, 20);
+            Serial.println("🥚 EGG: 50 flies! LEGENDARY!");
+          }
+
+          lastTouchState = true;
+          return;
+        }
+      }
+
       if (hitViewButton(tx, ty)) {
         currentView = (currentView + 1) % 3;
         canvas.fillScreen(TFT_BLACK);
@@ -1320,15 +1788,22 @@ void handleTouch(unsigned long now) {
 
       if (currentView == 0) {
         if (hitColdButton(tx, ty)) {
-          setMood(eyes.mood == EMO_COLD ? EMO_NEUTRAL : EMO_COLD, 0);
+          habits.coldsUsed++;
+          setMoodForced(eyes.mood == EMO_COLD ? EMO_NEUTRAL : EMO_COLD, 0);
           lastTouchState = true; return;
         }
         if (hitHeatButton(tx, ty)) {
-          setMood(eyes.mood == EMO_HEAT ? EMO_NEUTRAL : EMO_HEAT, 0);
+          habits.heatsUsed++;
+          setMoodForced(eyes.mood == EMO_HEAT ? EMO_NEUTRAL : EMO_HEAT, 0);
           lastTouchState = true; return;
         }
       }
       if (currentView == 0) onTouchStart(tx, ty);
+    } else {
+      // ★ 拖動中更新手指位置
+      fingerX = tx;
+      fingerY = ty;
+      fingerTrackEnd = now + 300;
     }
   } else {
     if (lastTouchState) {
@@ -1344,7 +1819,7 @@ void handleTouch(unsigned long now) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== 大臉小豬 + 便便 WiFi + 飛蟲追蹤 v2 ===");
+  Serial.println("\n=== 大臉小豬 v4 — 智能寵物版 ===");
 
   randomSeed(esp_random());
 
@@ -1362,14 +1837,27 @@ void setup() {
 
   WiFiFood::setMoodCallback([](int id, unsigned long dur) {
     switch (id) {
-      case WiFiFood::MOOD_HAPPY: setMood(EMO_HAPPY, dur); break;
-      case WiFiFood::MOOD_SAD:   setMood(EMO_SAD,   dur); break;
+      case WiFiFood::MOOD_HAPPY: {
+        habits.wifiMeals++;
+        setMood(EMO_HAPPY, dur);
+        if (habits.wifiMeals >= 10 && !eggWifi10) {
+          eggWifi10 = true;
+          Serial.println("🥚 EGG: 10 WiFi meals!");
+        }
+        break;
+      }
+      case WiFiFood::MOOD_SAD:   setMood(EMO_SAD, dur); break;
       default:                   setMood(EMO_NEUTRAL, 0); break;
     }
   });
   WiFiFood::begin();
 
   FlyBug::begin(eyes.pig.cx, eyes.pig.cy, eyes.pig.r);
+
+  habits.sessionStart = millis();
+  bootMillis = millis();
+  lastInteraction = millis();
+  nextIdleAction = millis() + 5000;
 
   canvas.fillScreen(TFT_BLACK);
   drawEyes(canvas);
@@ -1382,11 +1870,31 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   updateIMU();
+  updateTime();
   WiFiFood::update();
   FlyBug::update(now);
   processIMUEvents(now);
+  updateIdleBehavior(now);
   updateMoodState(now);
   handleTouch(now);
+
+  // ★ 手指追蹤結束
+  if (fingerTracking && now > fingerTrackEnd) {
+    fingerTracking = false;
+  }
+
+  // ★ 打招呼結束
+  if (welcomeMode && now > welcomeUntil) {
+    welcomeMode = false;
+  }
+
+  // ★ 愛意值衰減
+  static uint32_t lastDecay = 0;
+  if (now - lastDecay > 1000) {
+    lastDecay = now;
+    loveMeter -= 0.02f;
+    if (loveMeter < 0) loveMeter = 0;
+  }
 
   if (currentView == 0)      updateEyes(canvas, now);
   else if (currentView == 1) draw3DView(canvas);

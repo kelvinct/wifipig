@@ -1,4 +1,4 @@
-// include/FlyBug.h — 惱人的飛蟲（含位置查詢）
+// include/FlyBug.h — 惱人的飛蟲（含打中檢測）
 #pragma once
 #include <Arduino.h>
 #include <LovyanGFX.hpp>
@@ -115,6 +115,29 @@ inline bool getNearestFly(int px, int py, int& outX, int& outY) {
   return found;
 }
 
+// ════════════════ ★ 打中檢測 ════════════════
+// 回传被击中的飞虫 index，-1 表示没打中
+inline int hitTest(int tx, int ty, int radius = 18) {
+  int r2 = radius * radius;
+  for (int i = 0; i < MAX_FLIES; i++) {
+    if (!_flies[i].active) continue;
+    int dx = (int)_flies[i].x - tx;
+    int dy = (int)_flies[i].y - ty;
+    if (dx * dx + dy * dy < r2) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ════════════════ ★ 杀死飞虫 ════════════════
+inline void killFly(int idx) {
+  if (idx < 0 || idx >= MAX_FLIES) return;
+  if (!_flies[idx].active) return;
+  _flies[idx].active = false;
+  Serial.printf("[🐝] Fly #%d killed!\n", idx);
+}
+
 // ════════════════ 畫單隻蟲 ════════════════
 inline void _drawOneFly(LovyanGFX& g, const Fly& f) {
   int x = (int)f.x;
@@ -138,7 +161,7 @@ inline void _drawOneFly(LovyanGFX& g, const Fly& f) {
   // 頭
   g.fillCircle(x, y - 2, 1, 0x0000);
 
-  // 紅眼
+  // 紅眼（閃爍）
   uint16_t eyeCol = ((millis() / 200) % 2) ? 0xF800 : 0xA000;
   g.drawPixel(x - 1, y - 2, eyeCol);
   g.drawPixel(x + 1, y - 2, eyeCol);
@@ -157,6 +180,7 @@ inline void draw(LovyanGFX& g) {
   }
 }
 
+// ════════════════ 清空 ════════════════
 inline void clear() {
   for (int i = 0; i < MAX_FLIES; i++) _flies[i].active = false;
   _nextSpawn = millis() + random(1500, 3000);
